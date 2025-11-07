@@ -168,6 +168,7 @@ RTC_DATA_ATTR uint32_t rtc_secondsSinceLastWeekly = 0;
 // ### END ADDED
 
 
+
 void sleepAndReport(uint32_t sleepTimeSec, uint32_t awakeTimeSec) {
     // Check wakeup reason
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
@@ -237,6 +238,13 @@ void sleepAndReport(uint32_t sleepTimeSec, uint32_t awakeTimeSec) {
     if (rtc_secondsSinceLastWeekly >= WEEKLY_PERIOD_SEC) {
         Serial.println("Weekly extended listening window starting...");
         rtc_secondsSinceLastWeekly = 0; // reset counter
+
+        // Always send placeholder zero values to notify PC
+        Serial.println("Sending placeholder 0,0,0 to signal ready for weekly config");
+        zbTempSensor.setTemperature(0);
+        zbTempSensor.setHumidity(0);
+        zbCO2Sensor.setCarbonDioxide(0);
+
         // Stay awake for a slightly longer period to accept possible new config
         uint32_t start = millis();
         while ((millis() - start) < (WEEKLY_EXT_AWAKE_SEC * 1000UL)) {
@@ -254,7 +262,7 @@ void sleepAndReport(uint32_t sleepTimeSec, uint32_t awakeTimeSec) {
     uint32_t start = millis();
     while ((millis() - start) < awakeTimeSec * 1000) {
         // optional: process incoming config
-          if (newConfigReceived) {
+        if (newConfigReceived) {
             sleepTimeSec = nextSleepTimeSec; // update sleep timer
             newConfigReceived = false;
             Serial.printf("Updated sleep time to %d seconds\n", sleepTimeSec);
@@ -267,6 +275,7 @@ void sleepAndReport(uint32_t sleepTimeSec, uint32_t awakeTimeSec) {
     esp_sleep_enable_timer_wakeup(subInterval * 1000000ULL);
     esp_deep_sleep_start();
 }
+
 
 void onNewConfig(uint32_t newMinRepSec) {
     nextSleepTimeSec = newMinRepSec;
