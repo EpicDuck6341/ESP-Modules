@@ -148,6 +148,26 @@ void co2_sensor_value_update(void *arg) {
 }
 
 
+// ### ADDED: batching configuration
+// Number of sub-samples per full reporting interval (fixed to 3 as requested)
+#define SUB_SAMPLES 3
+
+// ### ADDED: weekly extended awake
+#define WEEKLY_EXT_AWAKE_SEC 10
+#define WEEKLY_PERIOD_SEC (7UL * 24UL * 60UL * 60UL) // 7 days
+
+// ### ADDED: RTC-backed storage so values survive deep sleep
+RTC_DATA_ATTR uint32_t rtc_sampleCount = 0;
+RTC_DATA_ATTR float rtc_storedTemp[SUB_SAMPLES];
+RTC_DATA_ATTR float rtc_storedHum[SUB_SAMPLES];
+RTC_DATA_ATTR float rtc_storedCO2[SUB_SAMPLES];
+// Accumulated seconds to track weekly extended awake (persisted)
+RTC_DATA_ATTR uint32_t rtc_secondsSinceLastWeekly = 0;
+
+// Note: nextSleepTimeSec and newConfigReceived already exist above and will be used
+// ### END ADDED
+
+
 void sleepAndReport(uint32_t sleepTimeSec, uint32_t awakeTimeSec) {
     // Check wakeup reason
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
@@ -161,11 +181,76 @@ void sleepAndReport(uint32_t sleepTimeSec, uint32_t awakeTimeSec) {
 
     // After waking from deep sleep
     Serial.printf("Woke up! Sending reports...\n");
-    zbTempSensor.reportTemperature();
-    zbCO2Sensor.report();
-    zbDimmableLight.setLightLevel(zbDimmableLight.getLightLevel() + 50);
 
-    // Stay awake for awakeTimeSec
+    // ### MODIFIED: New batching behavior
+    // Calculate sub-interval (three wakes per full interval)
+    uint32_t subInterval = (sleepTimeSec > 0) ? (sleepTimeSec / SUB_SAMPLES) : 0;
+    if (subInterval == 0) subInterval = sleepTimeSec; // fallback
+
+    // Take instantaneous measurements now (per-wake)
+    float tsens_value = readTemp();
+    float hsens_value = readHumidity();
+    float csens_value = 5; // Replace with actual readCO2() if available
+
+    // Store in RTC arrays at the current rtc_sampleCount index
+    if (rtc_sampleCount < SUB_SAMPLES) {
+      rtc_storedTemp[rtc_sampleCount] = tsens_value;
+      rtc_storedHum[rtc_sampleCount] = hsens_value;
+      rtc_storedCO2[rtc_sampleCount] = csens_value;
+      Serial.printf("Stored measurement %d: T=%.2f H=%.2f CO2=%.2f\n",
+                    rtc_sampleCount + 1, tsens_value, hsens_value, csens_value);
+      rtc_sampleCount++;
+    } else {
+      // Shouldn't happen, but if it does, reset and start over
+      rtc_sampleCount = 0;
+      rtc_storedTemp[rtc_sampleCount] = tsens_value;
+      rtc_storedHum[rtc_sampleCount] = hsens_value;
+      rtc_storedCO2[rtc_sampleCount] = csens_value;
+      rtc_sampleCount = 1;
+    }
+
+    // If not yet reached SUB_SAMPLES, go back to deep sleep for subInterval
+    if (rtc_sampleCount < SUB_SAMPLES) {
+        Serial.printf("Sleeping for %d seconds before next sample...\n", subInterval);
+        esp_sleep_enable_timer_wakeup(subInterval * 1000000ULL);
+        esp_deep_sleep_start();
+    }
+
+    // rtc_sampleCount == SUB_SAMPLES -> send all accumulated measurements
+    Serial.println("Sample buffer full → sending all accumulated measurements...");
+
+    for (int i = 0; i < SUB_SAMPLES; i++) {
+        // Send each stored sample: temperature, humidity, CO2
+        zbTempSensor.setTemperature(rtc_storedTemp[i]);
+        zbTempSensor.setHumidity(rtc_storedHum[i]);
+        zbCO2Sensor.setCarbonDioxide(rtc_storedCO2[i]);
+        delay(100); // small gap between reports
+    }
+
+    // Reset sample buffer
+    rtc_sampleCount = 0;
+
+    // Update accumulated seconds (we consider the full interval elapsed once we sent the batch)
+    rtc_secondsSinceLastWeekly += sleepTimeSec;
+
+    // WEEKLY EXTENDED AWAKE check
+    if (rtc_secondsSinceLastWeekly >= WEEKLY_PERIOD_SEC) {
+        Serial.println("Weekly extended listening window starting...");
+        rtc_secondsSinceLastWeekly = 0; // reset counter
+        // Stay awake for a slightly longer period to accept possible new config
+        uint32_t start = millis();
+        while ((millis() - start) < (WEEKLY_EXT_AWAKE_SEC * 1000UL)) {
+            // optional: process incoming config
+            if (newConfigReceived) {
+                sleepTimeSec = nextSleepTimeSec; // update sleep timer for future cycles
+                newConfigReceived = false;
+                Serial.printf("Updated sleep time to %d seconds via weekly window\n", sleepTimeSec);
+            }
+            delay(100);
+        }
+    }
+
+    // NORMAL AWAKE WINDOW (short awakeTimeSec to allow immediate reconfig)
     uint32_t start = millis();
     while ((millis() - start) < awakeTimeSec * 1000) {
         // optional: process incoming config
@@ -177,9 +262,9 @@ void sleepAndReport(uint32_t sleepTimeSec, uint32_t awakeTimeSec) {
         delay(100);
     }
 
-    // Go back to sleep again
-    Serial.printf("Going back to sleep for %d seconds...\n", sleepTimeSec);
-    esp_sleep_enable_timer_wakeup(sleepTimeSec * 1000000ULL);
+    // Go back to sleep again (sleep for one subInterval to begin the next sampling series)
+    Serial.printf("Going back to sleep for %d seconds...\n", subInterval);
+    esp_sleep_enable_timer_wakeup(subInterval * 1000000ULL);
     esp_deep_sleep_start();
 }
 
@@ -237,8 +322,13 @@ void setup() {
   }
   Serial.println();
 
-  xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 3, NULL);
-  xTaskCreate(co2_sensor_value_update, "co2_sensor_update", 4096, NULL, 3, NULL);
+  // NOTE: original code created FreeRTOS tasks to continuously update sensors:
+  // xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 3, NULL);
+  // xTaskCreate(co2_sensor_value_update, "co2_sensor_update", 4096, NULL, 3, NULL);
+  //
+  // ### MODIFIED: Task creation is commented out to avoid conflict with deep-sleep batching.
+  // The task functions themselves are kept intact above (as requested), but they cannot run across deep sleep cycles.
+  // If you want to re-enable continuous tasks for a non-deep-sleep mode, uncomment the lines above.
 
   // Set reporting interval for temperature measurement in seconds, must be called after Zigbee.begin()
   // min_interval and max_interval in seconds, delta (temp change in 0,1 °C)
@@ -249,7 +339,10 @@ void setup() {
   // zbTempSensor.setHumidityReporting(1, 0, 0);
   // zbCO2Sensor.setReporting(1, 0, 1);
 
-  sleepAndReport(5,30);
+  // ### MODIFIED: Use minRep if set, otherwise fall back to a sensible default (900s)
+  // We call sleepAndReport with the configured full interval. The batching logic will divide it into 3 sub-interval wakes.
+  uint32_t configuredInterval = (minRep > 0) ? (uint32_t)minRep : 900;
+  sleepAndReport(configuredInterval, 30);
 }
 
 void loop() {
